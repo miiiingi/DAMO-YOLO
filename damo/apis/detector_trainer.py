@@ -99,6 +99,7 @@ class Trainer:
         # metric record
         self.meter = MeterBuffer(window_size=cfg.miscs.print_interval_iters)
         self.file_name = os.path.join(cfg.miscs.output_dir, cfg.miscs.exp_name)
+        self.best_metric = -1.0
 
         # setup logger
         if get_rank() == 0:
@@ -125,7 +126,7 @@ class Trainer:
             self.tea_model = build_local_model(self.tea_cfg, self.device)
             self.tea_model.eval()
             tea_ckpt = torch.load(args.tea_ckpt, map_location=self.device)
-            #self.tea_model.load_state_dict(tea_ckpt['model'], strict=True)
+            # self.tea_model.load_state_dict(tea_ckpt['model'], strict=True)
             self.tea_model.load_pretrain_detector(args.tea_ckpt)
             self.feature_loss = FeatureLoss(self.model.neck.out_channels,
                                             self.tea_model.neck.out_channels,
@@ -255,7 +256,6 @@ class Trainer:
             name = pconfig.pop("name", None)
             param_groups += [{"params": p, **pconfig}]
 
-
         optimizer = optim_cls(param_groups, **cfg)
 
         return optimizer
@@ -283,9 +283,12 @@ class Trainer:
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = lr
 
-            inps = inps.to(self.device)  # ImageList: tensors, img_size
-            targets = [target.to(self.device)
-                       for target in targets]  # BoxList: bbox, num_boxes ...
+            inps = inps.to(
+                self.device, non_blocking=True
+            )  # ImageList: tensors, img_size
+            targets = [
+                target.to(self.device) for target in targets
+            ]  # BoxList: bbox, num_boxes ...
 
             model_start_time = time.time()
 
@@ -372,14 +375,26 @@ class Trainer:
                     inps.tensors.shape[2], inps.tensors.shape[3], eta_str)))
                 self.meter.clear_meters()
 
-            if (cur_iter + 1) % self.ckpt_interval_iters == 0:
-                self.save_ckpt('epoch_%d' % (self.epoch + 1),
-                               local_rank=local_rank)
-
             if (cur_iter + 1) % self.eval_interval_iters == 0:
                 time.sleep(0.003)
-                self.evaluate(local_rank, self.cfg.dataset.val_ann)
+
+                metric = self.evaluate(local_rank, self.cfg.dataset.val_ann)
+
+                if local_rank == 0:
+                    if metric > self.best_metric:
+                        logger.info(
+                            f"New best metric! {metric:.4f} (prev: {self.best_metric:.4f})"
+                        )
+                        self.best_metric = metric
+
+                        self.save_ckpt(
+                            ckpt_name="best_metric",
+                            local_rank=local_rank,
+                            update_best_ckpt=True,
+                        )
+
                 self.model.train()
+
             synchronize()
 
             if (cur_iter + 1) % self.iters_per_epoch == 0:
@@ -387,7 +402,7 @@ class Trainer:
 
         self.save_ckpt(ckpt_name='latest', local_rank=local_rank)
 
-    def save_ckpt(self, ckpt_name, local_rank, update_best_ckpt=False):
+    def save_ckpt(self, ckpt_name, local_rank, update_best_ckpt=True):
         if local_rank == 0:
             if self.ema_model is not None:
                 save_model = self.ema_model.model
@@ -425,6 +440,7 @@ class Trainer:
 
     def evaluate(self, local_rank, val_ann):
         assert len(self.val_loader) == len(val_ann)
+
         if self.ema_model is not None:
             evalmodel = self.ema_model.model
         else:
@@ -434,18 +450,29 @@ class Trainer:
 
         output_folders = [None] * len(val_ann)
         for idx, dataset_name in enumerate(val_ann):
-            output_folder = os.path.join(self.output_dir, self.exp_name,
-                                         'inference', dataset_name)
+            output_folder = os.path.join(
+                self.output_dir, self.exp_name, "inference", dataset_name
+            )
             if local_rank == 0:
                 mkdir(output_folder)
             output_folders[idx] = output_folder
 
         for output_folder, dataset_name, data_loader_val in zip(
                 output_folders, val_ann, self.val_loader):
-            inference(
+            metric = inference(
                 evalmodel,
                 data_loader_val,
                 dataset_name,
                 device=self.device,
                 output_folder=output_folder,
             )
+
+        # if local_rank == 0:
+        #     logger.info(f"Evaluation metric (mAP): {metric:.4f}")
+        # logger.debug(f"metric results key: {metric[0].results.keys()}")
+        # exit(0)
+        ap50 = metric[0].results["bbox"]["AP50"]
+        # ar100 = metric[0].results["box_proposal"]["AR@100"]
+        # final_metric = 0.7 * ap50 + 0.3 * ar100
+
+        return float(ap50)

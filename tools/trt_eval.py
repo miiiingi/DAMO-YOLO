@@ -12,6 +12,7 @@ from damo.apis.detector_inference_trt import inference
 from damo.config.base import parse_config
 from damo.dataset import build_dataloader, build_dataset
 from damo.utils import setup_logger, synchronize
+import pycuda.driver as cuda
 
 
 def mkdir(path):
@@ -73,9 +74,9 @@ def trt_inference(config,
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '5678'
     os.environ['WORLD_SIZE'] = '1'
-    torch.distributed.init_process_group(backend='nccl',
-                                         init_method='env://',
-                                         rank=0)
+    # torch.distributed.init_process_group(backend='nccl',
+    #                                      init_method='env://',
+    #                                      rank=0)
     synchronize()
 
     file_name = os.path.join(config.miscs.output_dir, config.miscs.exp_name)
@@ -102,6 +103,8 @@ def trt_inference(config,
     runtime = trt.Runtime(loggert)
     model = runtime.deserialize_cuda_engine(t.read())
     context = model.create_execution_context()
+        #     cuda.memcpy_htod_async(inp["device"], inp["host"], stream)
+    stream = cuda.Stream()
 
     # start evaluate
     output_folders = [None] * len(config.dataset.val_ann)
@@ -126,6 +129,7 @@ def trt_inference(config,
         inference(
             config,
             context,
+            stream,
             data_loader_val,
             dataset_name,
             iou_types=('bbox', ),
