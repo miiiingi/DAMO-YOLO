@@ -2,6 +2,7 @@
 # Copyright (C) Alibaba Group Holding Limited. All rights reserved.
 import argparse
 import sys
+import os
 
 import onnx
 import torch
@@ -13,6 +14,191 @@ from damo.base_models.core.ops import RepConv, SiLU
 from damo.config.base import parse_config
 from damo.detectors.detector import build_local_model
 from damo.utils.model_utils import get_model_info, replace_module
+from damo.base_models.core.end2end import TRT8_NMS
+
+from Calibrator import MyCalibrator
+
+
+def verify_onnx_model(onnx_path):
+    """ONNX 모델이 제대로 생성되었는지 검증"""
+    import onnx
+    from onnx import checker
+
+    try:
+        model = onnx.load(onnx_path)
+        checker.check_model(model)
+
+        # 그래프 노드 분석
+        graph = model.graph
+        logger.info(f"Total nodes: {len(graph.node)}")
+
+        real_ops = [n for n in graph.node if n.op_type.startswith("TRT::")]
+
+        if len(real_ops) == 0:
+            logger.error("TensorRT plugin node가 없습니다.")
+
+        if len(real_ops) == 0:
+            logger.warning("⚠️ 경고: 실제 연산 노드가 없습니다!")
+            logger.warning("모델이 더미 출력만 생성하도록 export되었을 수 있습니다.")
+            return False
+
+        # Random 노드 확인
+        random_ops = [n for n in graph.node if "Random" in n.op_type]
+        if random_ops:
+            logger.warning(f"⚠️ Random 노드 발견: {len(random_ops)}개")
+            for node in random_ops[:3]:  # 처음 3개만 출력
+                logger.warning(f"  - {node.name}: {node.op_type}")
+
+        return len(real_ops) > 0
+
+    except Exception as e:
+        logger.error(f"ONNX 검증 실패: {e}")
+        return False
+
+
+@logger.catch
+def build_trt_engine(
+    onnx_file_path,
+    dummy_data,
+    max_workspace_size=1 << 28,
+    fp16_mode=False,
+    int8_mode=False,
+    strip_weights=False,
+    use_ensemble: bool = False,
+):
+    import tensorrt as trt
+
+    """
+    ONNX 모델 파일을 TensorRT 엔진으로 변환하고 저장합니다.
+    :param onnx_file_path: ONNX 모델 파일 경로
+    :param engine_file_path: 저장할 TensorRT 엔진 파일 경로
+    :param max_workspace_size: 엔진 빌드 시 사용할 최대 워크스페이스 크기 (예: 256MB)
+    :param fp16_mode: FP16 모드 사용 여부 (사용 가능한 하드웨어인 경우 성능 향상)
+    """
+    engine_path = onnx_file_path.replace(".onnx", ".trt")
+    TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+    builder = trt.Builder(TRT_LOGGER)
+    config = builder.create_builder_config()
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, max_workspace_size)
+    config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED  # ★ 프로파일링 강화
+
+    explicit_batch_flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    network = builder.create_network(explicit_batch_flag)
+    parser = trt.OnnxParser(network, TRT_LOGGER)
+
+    try:
+        with open(onnx_file_path, "rb") as model_file:
+            onnx_model = model_file.read()
+            logger.info("54")
+            logger.info("Loading ONNX MODEL Successful!")
+        parse_success = parser.parse(onnx_model)
+        if not parse_success:
+            print("ONNX 모델 파싱 중 오류가 발생했습니다:")
+            for error_idx in range(parser.num_errors):
+                print(parser.get_error(error_idx))
+            raise RuntimeError("ONNX 모델을 파싱할 수 없습니다.")
+    except:
+        raise RuntimeError("ONNX 모델을 로딩할 수 없습니다.")
+
+    # SPARSE_WEIGHTS (Ampere+), OBEY_PRECISION_CONSTRAINTS 플래그
+    # config.set_flag(trt.BuilderFlag.SPARSE_WEIGHTS)
+    # config.set_flag(trt.BuilderFlag.OBEY_PRECISION_CONSTRAINTS)
+
+    inputs = [network.get_input(i) for i in range(network.num_inputs)]
+    outputs = [network.get_output(i) for i in range(network.num_outputs)]
+
+    for input in inputs:
+        logger.info(f"Model {input.name} shape: {input.shape} {input.dtype}")
+    for output in outputs:
+        logger.info(f"Model {output.name} shape: {output.shape} {output.dtype}")
+
+    profile = builder.create_optimization_profile()
+    input_name = inputs[0].name  # 보통 "input" 이라고 지정됨
+    min_shape = (1, dummy_data.shape[1], dummy_data.shape[2], dummy_data.shape[3])
+    opt_shape = tuple(dummy_data.shape)
+    max_shape = tuple(dummy_data.shape)
+
+    logger.info(
+        f"Optimization Profile for '{input_name}': min={min_shape}, opt={opt_shape}, max={max_shape}"
+    )
+    profile.set_shape(input_name, min_shape, opt_shape, max_shape)
+    config.add_optimization_profile(profile)
+
+    # 빌더 설정: workspace size 및 FP16 모드 활성화 (하드웨어 지원 시)
+    # builder.max_workspace_size = max_workspace_size
+    float16 = fp16_mode
+    int8 = int8_mode
+    logger.info(f"float16: {fp16_mode}, int8: {int8_mode}")
+    if float16:
+        config.set_flag(trt.BuilderFlag.FP16)
+    elif int8:
+        config.set_flag(trt.BuilderFlag.INT8)
+
+        # INT8 모드에서는 캘리브레이터를 반드시 등록해야 합니다.
+        # calibration_data는 미리 준비한 numpy 배열 리스트 또는 배열을 전달합니다.
+        input_shape = dummy_data.shape  # 첫 번째 입력 텐서의 shape 사용
+        calibrator = MyCalibrator(dummy_data.cpu().numpy(), 1, input_shape)
+        config.int8_calibrator = calibrator
+
+    if strip_weights:
+        config.set_flag(trt.BuilderFlag.STRIP_PLAN)
+
+    # TensorRT 엔진 빌드 (엔진 빌드 시 모델 최적화 수행)
+    engine_bytes = builder.build_serialized_network(network, config)
+    if engine_bytes is None:
+        raise RuntimeError("TensorRT 엔진 빌드에 실패했습니다.")
+
+    # 생성된 엔진을 파일로 직렬화 및 저장
+    with open(engine_path, "wb") as f:
+        f.write(engine_bytes)
+    logger.info(f"TensorRT 엔진이 성공적으로 저장되었습니다: {engine_path}")
+    return engine_path
+
+
+def export_to_onnx(model, dummy_input, onnx_file_path, opset_version, args):
+    """ONNX export with custom ops"""
+
+    model.eval()
+    logger.info("=== 모델 추론 테스트 ===")
+
+    with torch.no_grad():
+        test_output = model(dummy_input)
+        logger.info(f"✅ 모델 추론 성공! 출력 개수: {len(test_output)}")
+
+        for idx, out in enumerate(test_output):
+            if isinstance(out, torch.Tensor):
+                logger.info(f"  Output {idx}: shape={out.shape}, dtype={out.dtype}")
+
+    logger.info("=== ONNX Export 시작 ===")
+
+    # ★ Custom opset 등록 (TensorRT plugin을 위해 필수)
+    torch.onnx.register_custom_op_symbolic(
+        "TRT::INMSLayer", TRT8_NMS.symbolic, opset_version
+    )
+
+    torch.onnx.export(
+        model,
+        dummy_input,
+        onnx_file_path,
+        opset_version=opset_version,
+        input_names=[args.input],
+        output_names=(
+            ["num_dets", "det_boxes", "det_scores", "det_classes"]
+            if args.end2end
+            else [args.output]
+        ),
+        training=torch.onnx.TrainingMode.EVAL,
+        do_constant_folding=True,
+        export_params=True,
+        # ★ custom_opsets 추가
+        custom_opsets={"TRT": 1} if args.end2end else None,
+        # ★ operator_export_type 설정
+        operator_export_type=torch.onnx.OperatorExportTypes.ONNX_FALLTHROUGH,
+        dynamo=False,
+    )
+
+    logger.info(f"✅ ONNX 모델 저장: {onnx_file_path}")
+    exit(0)
 
 
 def make_parser():
@@ -68,6 +254,10 @@ def make_parser():
                         default=11,
                         type=int,
                         help='onnx opset version')
+    parser.add_argument(
+        "--fp16", action="store_true", help="using float 16 optimization"
+    )
+    parser.add_argument("--int8", action="store_true", help="using int 8 optimization")
     parser.add_argument('--end2end',
                         action='store_true',
                         help='export end2end onnx')
@@ -105,75 +295,6 @@ def make_parser():
     return parser
 
 
-@logger.catch
-def trt_export(onnx_path, batch_size, inference_h, inference_w, trt_mode, calib_loader=None, calib_cache='./damoyolo_calibration.cache'):
-    import tensorrt as trt
-    trt_version = int(trt.__version__[0])
-
-    if trt_mode == 'int8':
-        from calibrator import DataLoader, Calibrator
-        calib_loader = DataLoader(1, 999, 'datasets/coco/val2017', 640, 640)
-
-    TRT_LOGGER = trt.Logger()
-    engine_path = onnx_path.replace('.onnx', f'_{trt_mode}_bs{batch_size}.trt')
-
-    EXPLICIT_BATCH = 1 << (int)(
-        trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-
-    logger.info(f'trt_{trt_mode} converting ...')
-    with trt.Builder(TRT_LOGGER) as builder, \
-        builder.create_network(EXPLICIT_BATCH) as network, \
-        trt.OnnxParser(network, TRT_LOGGER) as parser:
-
-        logger.info('Loading ONNX file from path {}...'.format(onnx_path))
-        with open(onnx_path, 'rb') as model:
-            logger.info('Beginning ONNX file parsing')
-            if not parser.parse(model.read()):
-                logger.info('ERROR: Failed to parse the ONNX file.')
-                for error in range(parser.num_errors):
-                    logger.info(parser.get_error(error))
-
-        # builder.max_workspace_size = 1 << 30
-        builder.max_batch_size = batch_size
-        logger.info('Building an engine.  This would take a while...')
-        config = builder.create_builder_config()
-        config.max_workspace_size = 2 << 30
-
-        if trt_mode == 'fp16':
-            assert (builder.platform_has_fast_fp16 == True), 'not support fp16'
-            # builder.fp16_mode = True
-            config.flags |= 1 << int(trt.BuilderFlag.FP16)
-
-        if trt_mode == 'int8':
-            config.flags |= 1 << int(trt.BuilderFlag.INT8)
-            config.flags |= 1 << int(trt.BuilderFlag.FP16)
-
-        if calib_loader is not None:
-            config.int8_calibrator = Calibrator(calib_loader, calib_cache)
-            logger.info('Int8 calibation is enabled.')
-
-        if trt_version >= 8:
-            config.set_tactic_sources(1 << int(trt.TacticSource.CUBLAS))
-        engine = builder.build_engine(network, config)
-
-        try:
-            assert engine
-        except AssertionError:
-            _, _, tb = sys.exc_info()
-            traceback.print_tb(tb)  # Fixed format
-            tb_info = traceback.extract_tb(tb)
-            _, line, _, text = tb_info[-1]
-            raise AssertionError(
-                "Parsing failed on line {} in statement {}".format(line, text)
-            )
-
-        logger.info('generated trt engine named {}'.format(engine_path))
-        with open(engine_path, 'wb') as f:
-            f.write(engine.serialize())
-        return engine_path
-
-
-@logger.catch
 def main():
     args = make_parser().parse_args()
 
@@ -203,7 +324,6 @@ def main():
     # load model paramerters
     ckpt = torch.load(args.ckpt, map_location=device)
 
-    model.eval()
     if 'model' in ckpt:
         ckpt = ckpt['model']
     model.load_state_dict(ckpt, strict=True)
@@ -221,8 +341,7 @@ def main():
     model.head.nms = False
 
     if args.end2end:
-        import tensorrt as trt
-        trt_version = int(trt.__version__[0])
+        trt_version = 10
         model = End2End(model,
                         max_obj=args.topk_all,
                         iou_thres=args.iou_thres,
@@ -234,39 +353,55 @@ def main():
 
     dummy_input = torch.randn(args.batch_size, 3, args.img_size,
                               args.img_size).to(device)
-    _ = model(dummy_input)
-    torch.onnx._export(
-        model,
-        dummy_input,
-        onnx_name,
-        input_names=[args.input],
-        output_names=['num_dets', 'det_boxes', 'det_scores', 'det_classes']
-        if args.end2end else [args.output],
-        opset_version=args.opset,
-    )
-    onnx_model = onnx.load(onnx_name)
-    # Fix output shape
-    if args.end2end and not args.ort:
-        shapes = [
-            args.batch_size, 1, args.batch_size, args.topk_all, 4,
-            args.batch_size, args.topk_all, args.batch_size, args.topk_all
-        ]
-        for i in onnx_model.graph.output:
-            for j in i.type.tensor_type.shape.dim:
-                j.dim_param = str(shapes.pop(0))
+    if not os.path.isfile(onnx_name):
+        export_to_onnx(
+            model, dummy_input, onnx_name, opset_version=args.opset, args=args
+        )
+        logger.info("Complete Saving ONNX File...")
+        logger.info("Loading ONNX File...")
+        onnx_model = onnx.load(onnx_name)
+        logger.info("Complete Loading ONNX File...")
+        # Fix output shape
+        if args.end2end and not args.ort:
+            shapes = [
+                args.batch_size,
+                1,
+                args.batch_size,
+                args.topk_all,
+                4,
+                args.batch_size,
+                args.topk_all,
+                args.batch_size,
+                args.topk_all,
+            ]
+            for i in onnx_model.graph.output:
+                for j in i.type.tensor_type.shape.dim:
+                    j.dim_param = str(shapes.pop(0))
+        # try:
+        #     import onnxsim
 
-    try:
-        import onnxsim
-        logger.info('Starting to simplify ONNX...')
-        onnx_model, check = onnxsim.simplify(onnx_model)
-        assert check, 'check failed'
-    except Exception as e:
-        logger.info(f'simplify failed: {e}')
-    onnx.save(onnx_model, onnx_name)
-    logger.info('generated onnx model named {}'.format(onnx_name))
+        #     logger.info("Starting to simplify ONNX...")
+        #     # ★ onnxsim에 추가 옵션 전달
+        #     onnx_model, check = onnxsim.simplify(
+        #         onnx_model,
+        #     )
+        #     assert check, "check failed"
+        # except Exception as e:
+        #     logger.info(f"simplify failed: {e}")
+        # logger.info("Saving SIM ONNX File...")
+        # onnx.save(onnx_model, onnx_name)
+        # logger.info("Complete Saving SIM ONNX File...")
+        # logger.info(f"onnx name: {onnx_name}")
+
+    # ★ 검증 추가
+    if not verify_onnx_model(onnx_name):
+        logger.error("ONNX 모델이 올바르지 않습니다. export 설정을 확인하세요.")
+        raise RuntimeError("Invalid ONNX model exported")
+
     if args.trt:
-        trt_name = trt_export(onnx_name, args.batch_size, args.img_size,
-                              args.img_size, args.trt_type)
+        trt_name = build_trt_engine(
+            onnx_name, dummy_input, fp16_mode=args.fp16, int8_mode=args.int8
+        )
         if args.trt_eval:
             from trt_eval import trt_inference
             logger.info('start trt inference on coco validataion dataset')

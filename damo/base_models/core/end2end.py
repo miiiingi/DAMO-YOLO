@@ -31,61 +31,127 @@ class ORT_NMS(torch.autograd.Function):
                     max_output_boxes_per_class, iou_threshold, score_threshold)
 
 
-class TRT8_NMS(torch.autograd.Function):
-    '''TensorRT NMS operation'''
+class TRT10_NMS(torch.autograd.Function):
+    """
+    TensorRT 9/10 compatible NMS
+    - Export as ONNX NonMaxSuppression
+    - TensorRT will auto-lower this to EfficientNMS internally
+    """
+
     @staticmethod
     def forward(
         ctx,
         boxes,
         scores,
-        background_class=-1,
-        box_coding=1,
-        iou_threshold=0.45,
-        max_output_boxes=100,
-        plugin_version='1',
-        score_activation=0,
-        score_threshold=0.25,
+        max_output_boxes_per_class=torch.tensor([100]),
+        iou_threshold=torch.tensor([0.45]),
+        score_threshold=torch.tensor([0.25]),
     ):
-        batch_size, num_boxes, num_classes = scores.shape
-        num_det = torch.randint(0,
-                                max_output_boxes, (batch_size, 1),
-                                dtype=torch.int32)
-        det_boxes = torch.randn(batch_size, max_output_boxes, 4)
-        det_scores = torch.randn(batch_size, max_output_boxes)
-        det_classes = torch.randint(0,
-                                    num_classes,
-                                    (batch_size, max_output_boxes),
-                                    dtype=torch.int32)
+        # forward는 export용 더미
+        device = boxes.device
+        batch = scores.shape[0]
+        num_det = torch.randint(0, 100, (batch, 1), dtype=torch.int32, device=device)
+
+        det_boxes = torch.randn(batch, 100, 4, device=device)
+        det_scores = torch.randn(batch, 100, device=device)
+        det_classes = torch.randint(0, scores.shape[2], (batch, 100), device=device)
+
         return num_det, det_boxes, det_scores, det_classes
 
     @staticmethod
-    def symbolic(g,
-                 boxes,
-                 scores,
-                 background_class=-1,
-                 box_coding=1,
-                 iou_threshold=0.45,
-                 max_output_boxes=100,
-                 plugin_version='1',
-                 score_activation=0,
-                 score_threshold=0.25):
-        out = g.op('TRT::EfficientNMS_TRT',
-                   boxes,
-                   scores,
-                   background_class_i=background_class,
-                   box_coding_i=box_coding,
-                   iou_threshold_f=iou_threshold,
-                   max_output_boxes_i=max_output_boxes,
-                   plugin_version_s=plugin_version,
-                   score_activation_i=score_activation,
-                   score_threshold_f=score_threshold,
-                   outputs=4)
+    def symbolic(
+        g,
+        boxes,
+        scores,
+        max_output_boxes_per_class,
+        iou_threshold,
+        score_threshold,
+    ):
+        # ONNX 표준 NMS
+        selected_indices = g.op(
+            "NonMaxSuppression",
+            boxes,
+            scores,
+            max_output_boxes_per_class,
+            iou_threshold,
+            score_threshold,
+        )
+
+        # TensorRT expects final outputs → 후처리는 graph rewrite 대상
+        return selected_indices
+
+
+class TRT8_NMS(torch.autograd.Function):
+
+    """TensorRT 8.x NMS operation"""
+
+    @staticmethod
+
+    def forward(
+        ctx,
+        boxes,
+        scores,
+        max_output_boxes,
+        background_class=-1,
+        box_coding=1,
+        iou_threshold=0.45,
+        plugin_version="1",
+        score_activation=0,
+        score_threshold=0.25,
+    ):
+
+        batch_size, num_boxes, num_classes = scores.shape
+
+        num_det = torch.randint(0, max_output_boxes, (batch_size, 1), dtype=torch.int32)
+
+        det_boxes = torch.randn(batch_size, max_output_boxes, 4)
+
+        det_scores = torch.randn(batch_size, max_output_boxes)
+
+        det_classes = torch.randint(
+            0, num_classes, (batch_size, max_output_boxes), dtype=torch.int32
+        )
+
+        return num_det, det_boxes, det_scores, det_classes
+
+    @staticmethod
+
+    def symbolic(
+        g,
+        boxes,
+        scores,
+        max_output_boxes,
+        background_class=-1,
+        box_coding=1,
+        iou_threshold=0.45,
+        plugin_version="1",
+        score_activation=0,
+        score_threshold=0.25,
+    ):
+        print(f'g: {g}')
+        print(f'dir g: {dir(g)}')
+
+        out = g.op(
+            "TRT::INMSLayer",
+            boxes,
+            scores,
+            background_class_i=background_class,
+            box_coding_i=box_coding,
+            iou_threshold_f=iou_threshold,
+            max_output_boxes_i=max_output_boxes,
+            plugin_version_s=plugin_version,
+            score_activation_i=score_activation,
+            score_threshold_f=score_threshold,
+            outputs=4,
+        )
+
         nums, boxes, scores, classes = out
+
         return nums, boxes, scores, classes
 
 
 class TRT7_NMS(torch.autograd.Function):
-    '''TensorRT NMS operation'''
+    """TensorRT 7.x NMS operation"""
     @staticmethod
     def forward(
         ctx,
@@ -105,13 +171,10 @@ class TRT7_NMS(torch.autograd.Function):
         caffeSemantics=1,
     ):
         batch_size, num_boxes, numClasses = scores.shape
-        num_det = torch.randint(0,
-                                keepTopK, (batch_size, 1),
-                                dtype=torch.int32)
+        num_det = torch.randint(0, keepTopK, (batch_size, 1), dtype=torch.int32)
         det_boxes = torch.randn(batch_size, keepTopK, 4)
         det_scores = torch.randn(batch_size, keepTopK)
-        det_classes = torch.randint(0, numClasses,
-                                    (batch_size, keepTopK)).float()
+        det_classes = torch.randint(0, numClasses, (batch_size, keepTopK)).float()
         return num_det, det_boxes, det_scores, det_classes
 
     @staticmethod
@@ -185,10 +248,9 @@ class ONNX_ORT(nn.Module):
         dets = torch.cat([selected_box, selected_score], dim=1)
 
         batched_dets = dets.unsqueeze(0).repeat(batch, 1, 1)
-        batch_template = torch.arange(0,
-                                      batch,
-                                      dtype=batch_inds.dtype,
-                                      device=batch_inds.device)
+        batch_template = torch.arange(
+            0, batch, dtype=batch_inds.dtype, device=batch_inds.device
+        )
         batched_dets = batched_dets.where(
             (batch_inds == batch_template.unsqueeze(1)).unsqueeze(-1),
             batched_dets.new_zeros(1))
@@ -200,16 +262,16 @@ class ONNX_ORT(nn.Module):
 
         N = batched_dets.shape[0]
 
-        batched_dets = torch.cat(
-            (batched_dets, batched_dets.new_zeros((N, 1, 5))), 1)
-        batched_labels = torch.cat((batched_labels, -batched_labels.new_ones(
-            (N, 1))), 1)
+        batched_dets = torch.cat((batched_dets, batched_dets.new_zeros((N, 1, 5))), 1)
+        batched_labels = torch.cat(
+            (batched_labels, -batched_labels.new_ones((N, 1))), 1
+        )
 
         _, topk_inds = batched_dets[:, :, -1].sort(dim=1, descending=True)
 
-        topk_batch_inds = torch.arange(batch,
-                                       dtype=topk_inds.dtype,
-                                       device=topk_inds.device).view(-1, 1)
+        topk_batch_inds = torch.arange(
+            batch, dtype=topk_inds.dtype, device=topk_inds.device
+        ).view(-1, 1)
         batched_dets = batched_dets[topk_batch_inds, topk_inds, ...]
         det_classes = batched_labels[topk_batch_inds, topk_inds, ...]
         det_boxes, det_scores = batched_dets.split((4, 1), -1)
@@ -219,7 +281,7 @@ class ONNX_ORT(nn.Module):
 
 
 class ONNX_TRT7(nn.Module):
-    '''onnx module with TensorRT NMS operation.'''
+    """onnx module with TensorRT 7.x NMS operation."""
     def __init__(self,
                  max_obj=100,
                  iou_thres=0.45,
@@ -245,7 +307,6 @@ class ONNX_TRT7(nn.Module):
             device=self.device)
 
     def forward(self, score, box):
-        # box @= self.convert_matrix
         box = box.unsqueeze(2)
         self.numClasses = int(score.shape[2])
         num_det, det_boxes, det_scores, det_classes = TRT7_NMS.apply(
@@ -268,7 +329,7 @@ class ONNX_TRT7(nn.Module):
 
 
 class ONNX_TRT8(nn.Module):
-    '''onnx module with TensorRT NMS operation.'''
+    """onnx module with TensorRT 8.x NMS operation."""
     def __init__(self,
                  max_obj=100,
                  iou_thres=0.45,
@@ -286,38 +347,56 @@ class ONNX_TRT8(nn.Module):
 
     def forward(self, score, box):
         num_det, det_boxes, det_scores, det_classes = TRT8_NMS.apply(
-            box, score, self.background_class, self.box_coding,
-            self.iou_threshold, self.max_obj, self.plugin_version,
-            self.score_activation, self.score_threshold)
+            box,
+            score,
+            self.max_obj,
+            self.background_class,
+            self.box_coding,
+            self.iou_threshold,
+            self.plugin_version,
+            self.score_activation,
+            self.score_threshold,
+        )
         return num_det, det_boxes, det_scores, det_classes
 
 
 class End2End(nn.Module):
     '''export onnx or tensorrt model with NMS operation.'''
-    def __init__(self,
-                 model,
-                 max_obj=100,
-                 iou_thres=0.45,
-                 score_thres=0.25,
-                 device=None,
-                 ort=False,
-                 trt_version=7,
-                 with_preprocess=False):
+    def __init__(
+        self,
+        model,
+        max_obj=100,
+        iou_thres=0.45,
+        score_thres=0.25,
+        device=None,
+        ort=False,
+        trt_version=10,
+        with_preprocess=False,
+    ):
         super().__init__()
         device = device if device else torch.device('cpu')
         self.with_preprocess = with_preprocess
         self.model = model.to(device)
-        TRT = ONNX_TRT8 if trt_version >= 8 else ONNX_TRT7
-        self.patch_model = ONNX_ORT if ort else TRT
-        self.end2end = self.patch_model(max_obj, iou_thres, score_thres,
-                                        device)
+
+        # TensorRT 버전에 따라 적절한 NMS 모듈 선택
+        if ort:
+            TRT = ONNX_ORT
+        elif trt_version >= 8:
+            TRT = ONNX_TRT8
+        else:
+            TRT = ONNX_TRT7
+
+        self.patch_model = TRT
+        self.end2end = self.patch_model(max_obj, iou_thres, score_thres, device)
         self.end2end.eval()
 
     def forward(self, x):
         if self.with_preprocess:
-            x = x[:, [2, 1, 0], ...]
-            x = x * (1 / 255)
-        x = self.model(x)
+            x = x[:, [2, 1, 0], ...]  # BGR to RGB
+            x = x * (1 / 255)  # Normalize to [0, 1]
 
+        # 모델 추론 (실제 detection head 실행)
+        x = self.model(x)
+        # NMS 후처리
         x = self.end2end(x[0], x[1])
         return x
