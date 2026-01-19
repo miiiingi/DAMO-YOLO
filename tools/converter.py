@@ -19,43 +19,6 @@ from damo.base_models.core.end2end import TRT8_NMS
 from Calibrator import MyCalibrator
 
 
-def verify_onnx_model(onnx_path):
-    """ONNX 모델이 제대로 생성되었는지 검증"""
-    import onnx
-    from onnx import checker
-
-    try:
-        model = onnx.load(onnx_path)
-        checker.check_model(model)
-
-        # 그래프 노드 분석
-        graph = model.graph
-        logger.info(f"Total nodes: {len(graph.node)}")
-
-        real_ops = [n for n in graph.node if n.op_type.startswith("TRT::")]
-
-        if len(real_ops) == 0:
-            logger.error("TensorRT plugin node가 없습니다.")
-
-        if len(real_ops) == 0:
-            logger.warning("⚠️ 경고: 실제 연산 노드가 없습니다!")
-            logger.warning("모델이 더미 출력만 생성하도록 export되었을 수 있습니다.")
-            return False
-
-        # Random 노드 확인
-        random_ops = [n for n in graph.node if "Random" in n.op_type]
-        if random_ops:
-            logger.warning(f"⚠️ Random 노드 발견: {len(random_ops)}개")
-            for node in random_ops[:3]:  # 처음 3개만 출력
-                logger.warning(f"  - {node.name}: {node.op_type}")
-
-        return len(real_ops) > 0
-
-    except Exception as e:
-        logger.error(f"ONNX 검증 실패: {e}")
-        return False
-
-
 @logger.catch
 def build_trt_engine(
     onnx_file_path,
@@ -77,6 +40,7 @@ def build_trt_engine(
     """
     engine_path = onnx_file_path.replace(".onnx", ".trt")
     TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+    trt.init_libnvinfer_plugins(TRT_LOGGER, "")
     builder = trt.Builder(TRT_LOGGER)
     config = builder.create_builder_config()
     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, max_workspace_size)
@@ -89,7 +53,6 @@ def build_trt_engine(
     try:
         with open(onnx_file_path, "rb") as model_file:
             onnx_model = model_file.read()
-            logger.info("54")
             logger.info("Loading ONNX MODEL Successful!")
         parse_success = parser.parse(onnx_model)
         if not parse_success:
@@ -171,10 +134,10 @@ def export_to_onnx(model, dummy_input, onnx_file_path, opset_version, args):
 
     logger.info("=== ONNX Export 시작 ===")
 
-    # ★ Custom opset 등록 (TensorRT plugin을 위해 필수)
-    torch.onnx.register_custom_op_symbolic(
-        "TRT::INMSLayer", TRT8_NMS.symbolic, opset_version
-    )
+    # # ★ Custom opset 등록 (TensorRT plugin을 위해 필수)
+    # torch.onnx.register_custom_op_symbolic(
+    #     "TRT::INMSLayer", TRT8_NMS.symbolic, opset_version
+    # )
 
     torch.onnx.export(
         model,
@@ -191,14 +154,13 @@ def export_to_onnx(model, dummy_input, onnx_file_path, opset_version, args):
         do_constant_folding=True,
         export_params=True,
         # ★ custom_opsets 추가
-        custom_opsets={"TRT": 1} if args.end2end else None,
+        # custom_opsets={"TRT": 18} if args.end2end else None,
         # ★ operator_export_type 설정
-        operator_export_type=torch.onnx.OperatorExportTypes.ONNX_FALLTHROUGH,
+        operator_export_type=torch.onnx.OperatorExportTypes.ONNX,
         dynamo=False,
     )
 
     logger.info(f"✅ ONNX 모델 저장: {onnx_file_path}")
-    exit(0)
 
 
 def make_parser():
@@ -342,15 +304,16 @@ def main():
 
     if args.end2end:
         trt_version = 10
-        model = End2End(model,
-                        max_obj=args.topk_all,
-                        iou_thres=args.iou_thres,
-                        score_thres=args.conf_thres,
-                        device=device,
-                        ort=args.ort,
-                        trt_version=trt_version,
-                        with_preprocess=args.with_preprocess)
-
+        model = End2End(
+            model,
+            max_obj=args.topk_all,
+            iou_thres=args.iou_thres,
+            score_thres=args.conf_thres,
+            device=device,
+            ort=args.ort,
+            trt_version=trt_version,
+            with_preprocess=args.with_preprocess,
+        )
     dummy_input = torch.randn(args.batch_size, 3, args.img_size,
                               args.img_size).to(device)
     if not os.path.isfile(onnx_name):
@@ -392,11 +355,6 @@ def main():
         # onnx.save(onnx_model, onnx_name)
         # logger.info("Complete Saving SIM ONNX File...")
         # logger.info(f"onnx name: {onnx_name}")
-
-    # ★ 검증 추가
-    if not verify_onnx_model(onnx_name):
-        logger.error("ONNX 모델이 올바르지 않습니다. export 설정을 확인하세요.")
-        raise RuntimeError("Invalid ONNX model exported")
 
     if args.trt:
         trt_name = build_trt_engine(
