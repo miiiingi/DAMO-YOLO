@@ -118,7 +118,6 @@ class Trainer:
         # build model
         self.model = build_local_model(self.cfg, self.device)
         self.model = nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
-        logger.info('model:', self.model)
 
         if tea_cfg is not None:
             self.distill = True
@@ -268,8 +267,6 @@ class Trainer:
 
         # distributed model init
         self.model = build_ddp_model(self.model, local_rank)
-        logger.info('Model: {}'.format(self.model))
-
         logger.info('Training start...')
 
         # ----------- start training ------------------------- #
