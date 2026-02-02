@@ -19,9 +19,16 @@ from damo.structures.bounding_box import BoxList
 import time
 from matplotlib import pyplot as plt
 import tensorrt as trt
-import pycuda.driver as cuda
-import pycuda.autoinit  # ⭐ CUDA context 자동 생성
+import pandas as pd
+import shutil
+import json
 
+import pycuda.driver as cuda
+cuda.init()
+device = cuda.Device(0)
+
+ctx = device.retain_primary_context()
+ctx.push()
 ctx = pycuda.autoinit.context
 
 
@@ -33,31 +40,31 @@ def is_image_file(filename):
     return filename.split(".")[-1].lower() in IMAGES
 
 
-def allocate_buffers(engine: trt.ICudaEngine, batch_size: int):
+def allocate_buffers(
+    engine: trt.ICudaEngine, context: trt.IExecutionContext, batch_size: int
+):
     bindings = {}
     stream = cuda.Stream()
 
     output_tensors = {}
-    for i in range(engine.num_io_tensors):
-        tensor_name = engine.get_tensor_name(i)
-        tensor_mode = engine.get_tensor_mode(tensor_name)
-        dims = engine.get_tensor_shape(tensor_name)
+    for binding in engine:
+        dims = engine.get_tensor_shape(binding)
         # 요소 개수
         volume = 1
         for d in dims:
             volume *= d if d > 0 else 1
         volume *= batch_size
-        np_dtype = trt.nptype(engine.get_tensor_dtype(tensor_name))
+        np_dtype = trt.nptype(engine.get_tensor_dtype(binding))
         torch_dtype = torch.from_numpy(np.array([], dtype=np_dtype)).dtype
-        if tensor_mode == trt.TensorIOMode.INPUT:
+        if binding == "input":
             host_mem = cuda.pagelocked_empty(volume, np_dtype)
             device_mem = cuda.mem_alloc(host_mem.nbytes)
-            bindings[tensor_name] = device_mem
+            bindings[binding] = device_mem
         else:
             shape = (batch_size, *[d for d in dims if d > 0])
             output_tensor = torch.empty(size=shape, dtype=torch_dtype, device="cuda")
-            output_tensors[tensor_name] = output_tensor
-            bindings[tensor_name] = output_tensor.data_ptr()
+            output_tensors[binding] = output_tensor
+            bindings[binding] = output_tensor.data_ptr()
     return bindings, stream, output_tensors
 
 
@@ -74,8 +81,7 @@ def infer_with_dynamic_batch(
     images: torch.Tensor,
     max_dets: int = 100,
 ):
-    import pycuda.driver as cuda
-
+    stream = cuda.Stream()
     images = images.contiguous()
     N, C, H, W = images.shape
 
@@ -97,7 +103,7 @@ def infer_with_dynamic_batch(
     # =========================
     # 2️⃣ buffer 할당 (고정 max_dets)
     # =========================
-    bindings, stream, output_tensors = allocate_buffers(engine, N)
+    bindings, stream, outputs = allocate_buffers(engine, context, N)
     for binding in engine:
         context.set_tensor_address(binding, int(bindings[binding]))
 
@@ -112,7 +118,8 @@ def infer_with_dynamic_batch(
     # 5️⃣ enqueue
     # =========================
     do_inference(context, stream)
-    logger.info(f"output tensors: {output_tensors}")
+    logger.info(f"output boxes shape: {outputs['boxes'].shape}")
+    logger.info(f"output scores shape: {outputs['scores'].shape}")
     exit(0)
 
     return bindings
