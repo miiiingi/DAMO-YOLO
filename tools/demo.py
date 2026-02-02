@@ -33,9 +33,7 @@ def is_image_file(filename):
     return filename.split(".")[-1].lower() in IMAGES
 
 
-def allocate_buffers(
-    engine: trt.ICudaEngine, context: trt.IExecutionContext, batch_size: int
-):
+def allocate_buffers(engine: trt.ICudaEngine, batch_size: int):
     bindings = {}
     stream = cuda.Stream()
 
@@ -43,7 +41,6 @@ def allocate_buffers(
     for i in range(engine.num_io_tensors):
         tensor_name = engine.get_tensor_name(i)
         tensor_mode = engine.get_tensor_mode(tensor_name)
-        is_input = tensor_mode == trt.TensorIOMode.INPUT
         dims = engine.get_tensor_shape(tensor_name)
         # 요소 개수
         volume = 1
@@ -52,14 +49,13 @@ def allocate_buffers(
         volume *= batch_size
         np_dtype = trt.nptype(engine.get_tensor_dtype(tensor_name))
         torch_dtype = torch.from_numpy(np.array([], dtype=np_dtype)).dtype
-        if is_input:
+        if tensor_mode == trt.TensorIOMode.INPUT:
             host_mem = cuda.pagelocked_empty(volume, np_dtype)
             device_mem = cuda.mem_alloc(host_mem.nbytes)
             bindings[tensor_name] = device_mem
         else:
-            output_tensor = torch.empty(
-                size=tuple(dims), dtype=torch_dtype, device="cuda"
-            )
+            shape = (batch_size, *[d for d in dims if d > 0])
+            output_tensor = torch.empty(size=shape, dtype=torch_dtype, device="cuda")
             output_tensors[tensor_name] = output_tensor
             bindings[tensor_name] = output_tensor.data_ptr()
     return bindings, stream, output_tensors
@@ -76,28 +72,50 @@ def infer_with_dynamic_batch(
     engine: trt.ICudaEngine,
     context: trt.IExecutionContext,
     images: torch.Tensor,
-    use_ensemble: bool = False,
-) -> torch.Tensor:
+    max_dets: int = 100,
+):
+    import pycuda.driver as cuda
+
     images = images.contiguous()
     N, C, H, W = images.shape
-    input_name = engine.get_tensor_name(0)
+
+    # =========================
+    # 1️⃣ input shape 먼저 고정
+    # =========================
+    input_name = None
+    for i in range(engine.num_io_tensors):
+        name = engine.get_tensor_name(i)
+        if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+            input_name = name
+            break
+
+    assert input_name is not None
     context.set_input_shape(input_name, (N, C, H, W))
-    bindings, stream, output_tensors = allocate_buffers(
-        engine, context, images.shape[0]
-    )
+
+    assert context.all_binding_shapes_specified, "Input shape not fully specified"
+
+    # =========================
+    # 2️⃣ buffer 할당 (고정 max_dets)
+    # =========================
+    bindings, stream, output_tensors = allocate_buffers(engine, N)
     for binding in engine:
         context.set_tensor_address(binding, int(bindings[binding]))
 
     cuda.memcpy_dtod_async(
-        dest=int(bindings["images"]),
+        dest=int(bindings[input_name]),
         src=int(images.data_ptr()),
         size=images.nbytes,
         stream=stream,
     )
 
+    # =========================
+    # 5️⃣ enqueue
+    # =========================
     do_inference(context, stream)
+    logger.info(f"output tensors: {output_tensors}")
+    exit(0)
 
-    return output_tensors
+    return bindings
 
 
 class Infer():
