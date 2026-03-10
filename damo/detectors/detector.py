@@ -37,18 +37,34 @@ class Detector(nn.Module):
         self.head.init_weights()
 
     def load_pretrain_detector(self, pretrain_model):
+        ckpt = torch.load(pretrain_model, map_location="cpu", weights_only=True)[
+            "model"
+        ]
+        logger.info(f"Finetune from {pretrain_model}................")
 
-        state_dict = torch.load(pretrain_model, map_location='cpu', weights_only=True)['model']
-        logger.info(f'Finetune from {pretrain_model}................')
-        new_state_dict = {}
-        for k, v in self.state_dict().items():
-            k = k.replace('module.', '')
-            if 'head' in k:
-                new_state_dict[k] = self.state_dict()[k]
+        model_sd = self.state_dict()
+        load_sd = {}
+
+        for k, v in model_sd.items():
+            key = k.replace("module.", "")
+            if "head" in key:
+                # 기존 정책 유지: head는 새로 학습
                 continue
-            new_state_dict[k] = state_dict[k]
+            if key in ckpt and ckpt[key].shape == v.shape:
+                load_sd[k] = ckpt[key]
 
-        self.load_state_dict(new_state_dict, strict=True)
+        # 현재 모델 state_dict에 덮어쓰기
+        model_sd.update(load_sd)
+        self.load_state_dict(model_sd, strict=False)
+
+        loaded = set([k.replace("module.", "") for k in load_sd.keys()])
+        missing = [
+            k
+            for k in model_sd.keys()
+            if k.replace("module.", "") not in loaded and "head" not in k
+        ]
+        logger.info(f"Loaded params: {len(load_sd)}")
+        logger.info(f"Not loaded (new or shape-mismatch): {len(missing)}")
 
     def forward(self, x, targets=None, tea=False, stu=False):
         images = to_image_list(x)
