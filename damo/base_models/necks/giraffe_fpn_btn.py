@@ -58,6 +58,13 @@ class GiraffeNeckV2(nn.Module):
                                 spp=spp,
                                 depthwise=depthwise)
 
+        # 기존 merge_5 아래에 추가
+        self.x2_bypass = ConvBNAct(in_channels[0], out_channels[0], 1, 1, act=act)
+        self.x5_fuse = ConvBNAct(out_channels[0] * 2, out_channels[0], 1, 1, act=act)
+
+        # x2 bypass 영향도를 학습으로 조절 (sigmoid로 0~1)
+        self.x2_gate = nn.Parameter(torch.tensor(-0.2))
+
         # node x7: input x4, x5
         self.bu_conv57 = Conv(out_channels[0], out_channels[0], 3, 2, act=act)
         self.merge_7 = CSPStage(block_name,
@@ -110,8 +117,12 @@ class GiraffeNeckV2(nn.Module):
 
         # node x5
         x45 = self.upsample(x4)
-        x5 = torch.cat([x2, x45], 1)
-        x5 = self.merge_5(x5)
+        x5_in = torch.cat([x2, x45], 1)
+        x5_mix = self.merge_5(x5_in)
+
+        x2_keep = self.x2_bypass(x2)
+        gate = torch.sigmoid(self.x2_gate)
+        x5 = self.x5_fuse(torch.cat([x5_mix, gate * x2_keep], 1))
 
         # node x8
         # x8 = x5
