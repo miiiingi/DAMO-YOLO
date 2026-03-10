@@ -385,7 +385,7 @@ class Trainer:
                         self.best_metric = metric
 
                         self.save_ckpt(
-                            ckpt_name="best_metric",
+                            ckpt_name=self.cfg.train.ckpt_name,
                             local_rank=local_rank,
                             update_best_ckpt=True,
                         )
